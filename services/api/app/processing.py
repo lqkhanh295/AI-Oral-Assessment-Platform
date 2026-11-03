@@ -113,6 +113,7 @@ def tick(factory):
                     attempt.transcript = result["transcript"]
                     attempt.stt_confidence = result["stt_confidence"]
                     job.result = result
+                    job.stage = "GRADING"
                     job.status = "QUEUED_GRADING"
                 else:
                     attempt.assessment = grade_answer(db, exam, session, attempt,
@@ -123,16 +124,25 @@ def tick(factory):
                     job.status = "FAILED"
                     job.error = "PRONUNCIATION_FAILED: Chưa chấm được phát âm. Có thể thử chấm lại."
             except Exception as exc:
-                code, message = failure(exc) if job.stage == "GRADING" else (
-                    "STT_FAILED", "Nhận dạng audio thất bại. Kiểm tra cấu hình STT, model, quota và bản ghi rồi thử lại.")
-                job.status, job.error = "FAILED", f"{code}: {message}"
-                attempt.status = "GRADED"
-                attempt.assessment = {"score": None, "confidence": None, "review_required": True,
-                    "status": "FAILED", "error": code, "error_code": code, "reasoning_summary": message,
-                    "criteria": [], "rubric_version": exam.snapshot["rubric_version"],
-                    "knowledge_version": exam.snapshot["knowledge_version"]}
-                diagnostics.failed("submission." + job.stage, exc)
-                log.warning("submission_failed job=%s stage=%s type=%s", key, job.stage, type(exc).__name__)
+                from .runtime_settings import settings as runtime_settings_fn
+                max_retries = runtime_settings_fn().processing_max_retries
+                if job.runs < max_retries:
+                    backoff = min(60, 2 ** job.runs)
+                    job.status = "QUEUED_" + job.stage
+                    job.updated_at = time.time() + backoff
+                    job.error = f"RETRY_{job.runs}: {type(exc).__name__}: {str(exc)[:100]}"
+                    log.warning("submission_retry job=%s stage=%s run=%d backoff=%ds err=%s", key, job.stage, job.runs, backoff, type(exc).__name__)
+                else:
+                    code, message = failure(exc) if job.stage == "GRADING" else (
+                        "STT_FAILED", "Nhận dạng audio thất bại. Kiểm tra cấu hình STT, model, quota và bản ghi rồi thử lại.")
+                    job.status, job.error = "FAILED", f"{code}: {message}"
+                    attempt.status = "GRADED"
+                    attempt.assessment = {"score": None, "confidence": None, "review_required": True,
+                        "status": "FAILED", "error": code, "error_code": code, "reasoning_summary": message,
+                        "criteria": [], "rubric_version": exam.snapshot["rubric_version"],
+                        "knowledge_version": exam.snapshot["knowledge_version"]}
+                    diagnostics.failed("submission." + job.stage, exc)
+                    log.warning("submission_failed job=%s stage=%s type=%s", key, job.stage, type(exc).__name__)
             diagnostics.event("submission_finished", stage=job.stage, status=job.status)
         job.updated_at, job.lease_until, job.token = time.time(), None, None
         db.add(Audit(event="ANSWER_PROCESSING_" + job.status,

@@ -9,7 +9,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 
-from . import diagnostics, speech, storage
+from . import circuit_breaker, diagnostics, speech, storage
 from .models import Upload
 from .runtime_settings import settings
 
@@ -127,11 +127,24 @@ def assess(db, exam, attempt, transcript, assessment):
             with diagnostics.operation("gopt.assess", provider="gopt", model="gopt-librispeech",
                                        timeout_seconds=cfg.gopt_timeout, audio_bytes=size), \
                     httpx.Client(timeout=httpx.Timeout(cfg.gopt_timeout, connect=5), trust_env=False) as client:
-                response = client.post(cfg.gopt_url.rstrip("/") + "/assess",
-                    data={"transcript": transcript}, files={"audio": ("answer.webm", target, audio.mime_type)})
-                response.raise_for_status()
+                def _do_assess():
+                    target.seek(0)
+                    resp = client.post(cfg.gopt_url.rstrip("/") + "/assess",
+                        data={"transcript": transcript}, files={"audio": ("answer.webm", target, audio.mime_type)})
+                    resp.raise_for_status()
+                    return resp.json()
+
+                if cfg.circuit_breaker_enabled:
+                    cb = circuit_breaker.get_circuit_breaker(
+                        "gopt",
+                        failure_threshold=cfg.circuit_breaker_threshold,
+                        recovery_timeout=cfg.circuit_breaker_recovery,
+                    )
+                    payload = cb.call(_do_assess)
+                else:
+                    payload = _do_assess()
                 phase = "response"
-                result = PronunciationResult.model_validate(response.json()).model_dump()
+                result = PronunciationResult.model_validate(payload).model_dump()
         result["audio_sha256"] = audio.sha256
         result["transcript_sha256"] = hashlib.sha256(transcript.encode()).hexdigest()
     except Exception as exc:

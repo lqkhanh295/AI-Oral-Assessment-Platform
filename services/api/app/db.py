@@ -10,6 +10,11 @@ Path(cfg.data_dir).mkdir(parents=True, exist_ok=True)
 engine = create_engine(
     cfg.database_url,
     pool_pre_ping=True,
+    **(
+        {"pool_size": cfg.db_pool_size, "max_overflow": cfg.db_max_overflow}
+        if not cfg.database_url.startswith("sqlite")
+        else {}
+    ),
     connect_args={"check_same_thread": False} if cfg.database_url.startswith("sqlite") else {},
 )
 if engine.dialect.name == "sqlite":

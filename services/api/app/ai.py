@@ -32,15 +32,27 @@ def ollama(operation, payload):
     cfg = settings()
     with diagnostics.operation("ollama." + operation, provider="local", model=payload.get("model"),
                                timeout_seconds=cfg.local_llm_timeout, connect_timeout_seconds=10) as metrics:
-        response = httpx.post(
-            cfg.local_llm_url.rstrip("/") + "/api/" + operation,
-            json=payload,
-            timeout=httpx.Timeout(cfg.local_llm_timeout, connect=10),
-        )
-        response.raise_for_status()
-        result = response.json()
-        if result.get("error"):
-            raise ValueError("Local LLM returned an error")
+        def _do_post():
+            resp = httpx.post(
+                cfg.local_llm_url.rstrip("/") + "/api/" + operation,
+                json=payload,
+                timeout=httpx.Timeout(cfg.local_llm_timeout, connect=10),
+            )
+            resp.raise_for_status()
+            res = resp.json()
+            if res.get("error"):
+                raise ValueError("Local LLM returned an error")
+            return res
+
+        if cfg.circuit_breaker_enabled:
+            cb = circuit_breaker.get_circuit_breaker(
+                "ollama",
+                failure_threshold=cfg.circuit_breaker_threshold,
+                recovery_timeout=cfg.circuit_breaker_recovery,
+            )
+            result = cb.call(_do_post)
+        else:
+            result = _do_post()
         for key in ("total_duration", "load_duration", "prompt_eval_duration", "eval_duration",
                     "prompt_eval_count", "eval_count"):
             if type(result.get(key)) in (int, float) and math.isfinite(result[key]):
@@ -51,14 +63,25 @@ def ollama(operation, payload):
 def gemini(operation, model, payload):
     with diagnostics.operation("gemini." + operation, provider="gemini", model=model,
                                timeout_seconds=settings().gemini_timeout):
-        response = httpx.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:{operation}",
-            headers={"x-goog-api-key": settings().gemini_api_key},
-            json=payload,
-            timeout=settings().gemini_timeout,
-        )
-        response.raise_for_status()
-        return response.json()
+        cfg = settings()
+        def _do_post():
+            resp = httpx.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:{operation}",
+                headers={"x-goog-api-key": cfg.gemini_api_key},
+                json=payload,
+                timeout=cfg.gemini_timeout,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+        if cfg.circuit_breaker_enabled:
+            cb = circuit_breaker.get_circuit_breaker(
+                "gemini",
+                failure_threshold=cfg.circuit_breaker_threshold,
+                recovery_timeout=cfg.circuit_breaker_recovery,
+            )
+            return cb.call(_do_post)
+        return _do_post()
 
 
 def embed(text, task="RETRIEVAL_DOCUMENT"):

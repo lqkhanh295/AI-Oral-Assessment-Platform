@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     stt_language: str = "vi"
     stt_cpu_threads: int = Field(default=0, ge=0)
     worker_serial: bool = True
+    worker_concurrency: int = Field(default=4, ge=1, le=32)
+    db_pool_size: int = Field(default=20, ge=5, le=100)
+    db_max_overflow: int = Field(default=10, ge=0, le=50)
+    circuit_breaker_enabled: bool = True
+    circuit_breaker_threshold: int = Field(default=5, ge=1, le=20)
+    circuit_breaker_recovery: float = Field(default=30.0, ge=5.0, le=300.0)
+    processing_max_retries: int = Field(default=1, ge=1, le=10)
     gopt_enabled: bool = False
     gopt_url: str = "http://gopt:8000"
     gopt_timeout: int = Field(default=960, ge=30, le=3600)

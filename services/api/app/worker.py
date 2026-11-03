@@ -349,13 +349,39 @@ def process_next():
         return True
 
 
+def run_worker_pool(concurrency: int | None = None):
+    cfg = runtime_settings.settings()
+    concurrency = concurrency or cfg.worker_concurrency
+    if cfg.worker_serial or concurrency <= 1:
+        log.info("Starting single-threaded worker (worker_serial=%s)", cfg.worker_serial)
+        while True:
+            try:
+                worked = tick()
+            except Exception as exc:
+                log.error("worker_error type=%s", type(exc).__name__)
+                worked = False
+            if not worked:
+                time.sleep(2)
+    else:
+        import concurrent.futures
+        log.info("Starting concurrent worker pool (concurrency=%d)", concurrency)
+
+        def _worker_loop(worker_id: int):
+            log.info("Worker thread %d ready", worker_id)
+            while True:
+                try:
+                    worked = process_next()
+                except Exception as exc:
+                    log.error("worker_thread_%d_error type=%s", worker_id, type(exc).__name__)
+                    worked = False
+                if not worked:
+                    time.sleep(1)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="oral-worker") as executor:
+            futures = [executor.submit(_worker_loop, i) for i in range(concurrency)]
+            concurrent.futures.wait(futures)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    while True:
-        try:
-            worked = tick()
-        except Exception as exc:
-            log.error("worker_error type=%s", type(exc).__name__)
-            worked = False
-        if not worked:
-            time.sleep(2)
+    run_worker_pool()

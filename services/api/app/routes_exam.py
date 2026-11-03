@@ -302,17 +302,8 @@ def submit(
         # A skipped answer can only require review; it cannot earn an AI score.
         fail(403, "DESKTOP_STT_SKIP_REQUIRED", "Chỉ hỗ trợ bỏ qua model cục bộ khi sinh viên thi trên desktop")
     job = db.scalar(select(ProcessingJob).where(ProcessingJob.attempt_id == key))
-    if attempt.submit_key and (job or body.processing_mode == "server_audio"):
-        if job and body.processing_mode == "server_audio" and attempt.submit_key == idempotency_key:
-            return {"status": attempt.status}
-        fail(409, "ALREADY_SUBMITTED", "Câu trả lời đã được nộp")
     if attempt.submit_key:
-        if (
-            attempt.submit_key == idempotency_key
-            and attempt.transcript == body.transcript
-            and attempt.stt_confidence == body.stt_confidence
-            and stt_skipped_reason(db, key) == body.stt_skipped_reason
-        ):
+        if attempt.submit_key == idempotency_key:
             return {"status": attempt.status}
         fail(409, "ALREADY_SUBMITTED", "Câu trả lời đã được nộp")
     # A started answer may arrive after the deadline; preserve it for review, never lose its transcript.
@@ -434,10 +425,16 @@ async def chunk(
     row = by_id(db, Upload, key, lock=True)
     owned_attempt(db, row.attempt_id, user)
     if row.status == "COMPLETED":
-        fail(409, "COMPLETED", "Upload đã hoàn tất")
+        return {"ok": True, "index": index, "status": "COMPLETED"}
     if not 0 <= index < row.total_chunks:
         fail(422, "CHUNK_INDEX", "Chunk index không hợp lệ")
     expected = min(settings().media_chunk_bytes, row.size - index * settings().media_chunk_bytes)
+    folder = upload_folder(row.id)
+    chunk_file = folder / str(index)
+    if chunk_file.is_file() and chunk_file.stat().st_size == expected:
+        existing_hash = hashlib.sha256(chunk_file.read_bytes()).hexdigest()
+        if existing_hash == x_chunk_sha256:
+            return {"ok": True, "index": index, "already_received": True}
     content = bytearray()
     async for part in request.stream():
         content.extend(part)
@@ -445,11 +442,10 @@ async def chunk(
             fail(413, "CHUNK_SIZE", "Chunk quá lớn")
     if len(content) != expected or hashlib.sha256(content).hexdigest() != x_chunk_sha256:
         fail(422, "CHECKSUM_MISMATCH", "Kích thước hoặc checksum chunk không khớp")
-    folder = upload_folder(row.id)
     with tempfile.NamedTemporaryFile(dir=folder, delete=False) as temp:
         temp.write(content)
         tmp = temp.name
-    os.replace(tmp, folder / str(index))
+    os.replace(tmp, chunk_file)
     db.commit()
     return {"ok": True, "index": index}
 

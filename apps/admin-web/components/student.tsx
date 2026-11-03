@@ -31,6 +31,17 @@ import DesktopSpeechSettings, {
   type DesktopModel,
 } from "./desktop-speech-settings";
 import { createNoiseFilter, type NoiseFilter } from "../lib/noise-filter";
+import {
+  savePendingAnswer,
+  getPendingAnswer,
+  deletePendingAnswer,
+  saveUploadJob,
+  updateUploadJobStatus,
+  getUploadJobsForSession,
+  deleteUploadJob,
+  clearCompletedUploadJobs,
+  clearSessionState,
+} from "../lib/offlineStorage";
 import DesktopDisplaySettings, {
   type DesktopDisplayStatus,
 } from "./desktop-display-settings";
@@ -133,6 +144,7 @@ export default function Student() {
     [processing, setProcessing] = useState(false),
     [submitting, setSubmitting] = useState(false),
     [speechStage, setSpeechStage] = useState("Đang tải cấu hình nhận dạng…");
+  const [isOnline, setIsOnline] = useState(true);
   const [answer, setAnswer] = useState<PendingAnswer | null>(null),
     [jobs, setJobs] = useState<UploadJob[]>([]),
     [remaining, setRemaining] = useState(0),
@@ -169,6 +181,87 @@ export default function Student() {
     setSession(s);
     return s;
   }, []);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    setIsOnline(navigator.onLine);
+    const onOnline = () => {
+      setIsOnline(true);
+      setJobs((all) => {
+        all
+          .filter((j) => j.status === "failed")
+          .forEach((j) => void runUpload(j));
+        return all;
+      });
+    };
+    const onOffline = () => {
+      setIsOnline(false);
+    };
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!session?.id) return;
+    let cancelled = false;
+
+    async function recoverOfflineData() {
+      try {
+        const storedJobs = await getUploadJobsForSession(session!.id);
+        if (cancelled) return;
+        const incomplete = storedJobs.filter((j) => j.status !== "done");
+        if (incomplete.length > 0) {
+          setJobs((current) => {
+            const currentIds = new Set(current.map((j) => j.id));
+            const newJobs: UploadJob[] = incomplete
+              .filter((j) => !currentIds.has(j.id))
+              .map((j) => ({
+                id: j.id,
+                attemptId: j.attemptId,
+                kind: j.kind,
+                blob: j.blob,
+                progress: j.progress,
+                status: j.status,
+                error: j.error,
+              }));
+            if (newJobs.length > 0) {
+              setTimeout(() => {
+                newJobs.forEach((job) => void runUpload(job));
+              }, 500);
+            }
+            return [...current, ...newJobs];
+          });
+        }
+
+        if (session!.current_attempt?.id && !answer) {
+          const storedAnswer = await getPendingAnswer(session!.current_attempt.id);
+          if (cancelled || !storedAnswer) return;
+          setAnswer({
+            attemptId: storedAnswer.attemptId,
+            audio: storedAnswer.audio,
+            filteredAudio: storedAnswer.filteredAudio,
+            sttSource: storedAnswer.sttSource,
+            transcript: storedAnswer.transcript,
+            originalText: storedAnswer.originalText,
+            confidence: storedAnswer.confidence,
+            sttSkippedReason: storedAnswer.sttSkippedReason,
+            key: storedAnswer.key,
+          });
+        }
+      } catch (err) {
+        console.warn("[recovery] Could not recover offline data:", err);
+      }
+    }
+
+    void recoverOfflineData();
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.id, session?.current_attempt?.id]);
+
   const guard = useExamGuard(session, () => stopRef.current());
   function endAnswer() {
     autoSubmitRecording.current = timedQuestions;
@@ -594,6 +687,19 @@ export default function Student() {
           ? "filtered"
           : "original";
       setAnswer(a);
+      void savePendingAnswer({
+        attemptId,
+        sessionId: session?.id ?? "",
+        audio: a.audio,
+        filteredAudio: a.filteredAudio,
+        sttSource: a.sttSource,
+        transcript: a.transcript,
+        confidence: a.confidence,
+        sttSkippedReason: a.sttSkippedReason,
+        originalText: a.originalText,
+        key: a.key,
+        savedAt: Date.now(),
+      });
       if (serverProcessing) {
         setProcessing(false);
         setError("");
@@ -616,6 +722,19 @@ export default function Student() {
         a.confidence = stt.stt_confidence;
         a.sttSkippedReason = stt.stt_skipped_reason;
         setAnswer({ ...a });
+        void savePendingAnswer({
+          attemptId,
+          sessionId: session?.id ?? "",
+          audio: a.audio,
+          filteredAudio: a.filteredAudio,
+          sttSource: a.sttSource,
+          transcript: a.transcript,
+          confidence: a.confidence,
+          sttSkippedReason: a.sttSkippedReason,
+          originalText: a.originalText,
+          key: a.key,
+          savedAt: Date.now(),
+        });
       } catch (e) {
         setError(
           `${errorText(e)} ${window.oralDesktop ? "Bạn có thể thử STT lại hoặc ghi lại câu trả lời." : "Bạn có thể thử STT lại hoặc nhập transcript; bản nhập tay sẽ cần giảng viên xem lại."}`,
@@ -658,6 +777,7 @@ export default function Student() {
       setJobs((all) =>
         all.map((j) => (j.id === job.id ? { ...j, ...patch } : j)),
       );
+      void updateUploadJobStatus(job.id, patch);
     };
     update({ status: "uploading", error: undefined });
     try {
@@ -685,7 +805,7 @@ export default function Student() {
             );
             const checksum = await hash(part);
             let last: unknown;
-            for (let retry = 0; retry < 3; retry++) {
+            for (let retry = 0; retry < 5; retry++) {
               try {
                 await api(`/uploads/${init.id}/chunks/${i}`, {
                   method: "PUT",
@@ -696,7 +816,7 @@ export default function Student() {
                 break;
               } catch (e) {
                 last = e;
-                await new Promise((r) => setTimeout(r, 500 * 2 ** retry));
+                await new Promise((r) => setTimeout(r, Math.min(8000, 500 * 2 ** retry)));
               }
             }
             if (last) throw last;
@@ -706,6 +826,7 @@ export default function Student() {
         await send(`/uploads/${init.id}/complete`);
       }
       update({ status: "done", progress: 100 });
+      void deleteUploadJob(job.id);
       return true;
     } catch (e) {
       update({ status: "failed", error: errorText(e) });
@@ -753,6 +874,19 @@ export default function Student() {
         answerUploads.current.set(answer.key, added);
         const newJobs = added;
         setJobs((all) => [...all, ...newJobs]);
+        for (const job of added) {
+          void saveUploadJob({
+            id: job.id,
+            attemptId: job.attemptId,
+            sessionId: session.id,
+            kind: job.kind,
+            blob: job.blob,
+            progress: job.progress,
+            status: job.status,
+            updatedAt: Date.now(),
+          });
+        }
+        void deletePendingAnswer(answer.attemptId);
       }
       setError("");
       if (automatic) {
@@ -797,6 +931,8 @@ export default function Student() {
         await send<ExamSession>(`/exam-sessions/${session.id}/finish`),
       );
       await guard.release();
+      void clearSessionState(session.id);
+      void clearCompletedUploadJobs(session.id);
     } catch (e) {
       guard.finishFailed();
       throw e;
@@ -814,6 +950,18 @@ export default function Student() {
       status: "pending",
     };
     setJobs((all) => [...all, job]);
+    if (session?.id) {
+      void saveUploadJob({
+        id: job.id,
+        attemptId: job.attemptId,
+        sessionId: session.id,
+        kind: job.kind,
+        blob: job.blob,
+        progress: job.progress,
+        status: job.status,
+        updatedAt: Date.now(),
+      });
+    }
     const item = { job, task: runUpload(job) };
     screenJobs.current.set(blob, item);
     return item;
@@ -1014,6 +1162,24 @@ export default function Student() {
           <Badge status={submissionBadge(session.status)} />
         )}
       </div>
+      {!isOnline && (
+        <div
+          role="status"
+          style={{
+            background: "#fff3cd",
+            color: "#856404",
+            padding: "10px 14px",
+            borderRadius: 8,
+            marginBottom: 12,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            fontSize: "0.95rem",
+          }}
+        >
+          <span>⚠️ <strong>Mất kết nối mạng:</strong> Bài thi vẫn được lưu an toàn trong máy của bạn. Hệ thống sẽ tự động đồng bộ khi có kết nối trở lại.</span>
+        </div>
+      )}
       {error && (
         <p role="alert" className="error">
           {error}
